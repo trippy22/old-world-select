@@ -4,6 +4,8 @@ Brings back the old world select on the login screen: one black screen with a
 full-width grid of worlds, the World / Players / Location / Type sort arrows and
 a Cancel button, without the side menu of filters.
 
+![The old world select on the login screen](docs/old-world-select.webp)
+
 ## Using it
 
 Click the world button in the bottom-left of the login screen as usual.
