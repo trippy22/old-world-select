@@ -54,7 +54,8 @@ import org.slf4j.LoggerFactory;
  */
 @PluginDescriptor(name = "Old World Select", internalName = "old-world-select",
     description = "Replaces the logged-out world select with the old single-grid one.",
-    tags = {"world", "hopper", "select", "login", "old"})
+    tags = {"world", "worlds", "hop", "hopper", "switch", "switcher", "select", "selector", "list", "login",
+        "logout", "screen", "old", "classic", "legacy"})
 public class OldWorldSelectPlugin extends Plugin
 {
     private static final Logger log = LoggerFactory.getLogger(OldWorldSelectPlugin.class);
