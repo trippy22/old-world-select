@@ -16,18 +16,15 @@ Click the world button in the bottom-left of the login screen as usual.
 - Hover a world to see its activity.
 - Click Cancel or press Escape to go back.
 
-The plugin only acts on the login screen. It works with or without a GPU plugin.
+The plugin only acts on the login screen. It works with or without a GPU plugin,
+and with stretched mode.
 
 ## How it draws
 
-RuneLite overlays only render in game, so the plugin paints into the client's
-frame while the world select is open:
-
-- With a GPU plugin enabled, that plugin's draw callbacks are wrapped in a
-  pass-through for as long as the world select is open, and restored when it
-  closes.
-- Without one, the plugin presents the frame itself for as long as the world
-  select is open, then hands presentation back to the client.
+RuneLite overlays only render in game, so the world select is a borderless
+window laid exactly over the game canvas while it is open. It follows the client
+when it moves or resizes, and never takes keyboard focus. Nothing in the
+client's rendering is touched.
 
 World data comes from RuneLite's own world service; the plugin makes no network
 requests of its own.

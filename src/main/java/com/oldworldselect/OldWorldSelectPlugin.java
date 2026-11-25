@@ -2,13 +2,12 @@ package com.oldworldselect;
 
 import java.awt.Canvas;
 import java.awt.Color;
-import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.FontMetrics;
 import java.awt.GradientPaint;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
-import java.awt.Image;
+import java.awt.Rectangle;
 import java.awt.RenderingHints;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
@@ -19,16 +18,15 @@ import java.util.EnumSet;
 import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
 import javax.inject.Inject;
+import javax.swing.JComponent;
+import javax.swing.JWindow;
 import javax.swing.SwingUtilities;
-import net.runelite.api.BufferProvider;
+import javax.swing.Timer;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
-import net.runelite.api.MainBufferProvider;
-import net.runelite.api.Scene;
 import net.runelite.api.SpritePixels;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.gameval.SpriteID;
-import net.runelite.api.hooks.DrawCallbacks;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.WorldService;
@@ -38,7 +36,6 @@ import net.runelite.client.input.MouseAdapter;
 import net.runelite.client.input.MouseManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.ui.DrawManager;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.util.WorldUtil;
 import net.runelite.http.api.worlds.World;
@@ -51,10 +48,9 @@ import org.slf4j.LoggerFactory;
  * Brings back the old logged-out world select: one black screen, a grid of world buttons,
  * four sort headers and a Cancel button - no side menu.
  *
- * The login screen is drawn by the engine, and RuneLite overlays only render in game. With a
- * GPU plugin running, the world select is painted into the game buffer just before that
- * plugin uploads it; without one the plugin hands the finished frame to the window itself
- * while the screen is open. Nothing is hooked unless the world select is actually open.
+ * The login screen is drawn by the engine, and RuneLite overlays only render in game, so the
+ * world select is a borderless window laid exactly over the game canvas. Nothing in the
+ * client's rendering is touched.
  */
 @PluginDescriptor(name = "Old World Select", internalName = "old-world-select",
     description = "Replaces the logged-out world select with the old single-grid one.",
@@ -70,11 +66,11 @@ public class OldWorldSelectPlugin extends Plugin
     // World button size (sl_back sprites).
     private static final int BUTTON_W = 88;
     private static final int BUTTON_H = 19;
-    // "Click to switch" world button on the login screen, relative to the 765px area.
-    private static final int SWITCH_X = 5;
-    private static final int SWITCH_Y = 463;
-    private static final int SWITCH_W = 100;
-    private static final int SWITCH_H = 35;
+    // World button in the bottom-left corner of the login screen, relative to the 765px area.
+    private static final int SWITCH_X = 4;
+    private static final int SWITCH_Y = 450;
+    private static final int SWITCH_W = 126;
+    private static final int SWITCH_H = 53;
 
     private static final int SORT_WORLD = 0;
     private static final int SORT_PLAYERS = 1;
@@ -160,25 +156,20 @@ public class OldWorldSelectPlugin extends Plugin
     @Inject
     private ScheduledExecutorService executor;
 
-    @Inject
-    private DrawManager drawManager;
-
-    private final Runnable frameListener = this::onFrame;
-    // Only touched on the client thread.
-    private PassThroughDrawCallbacks wrapper;
-    // GPU off only: while the world select is open the plugin hands frames to the window
-    // itself. presenterBuffer is the game buffer in use when that started.
-    private FramePresenter presenter;
-    private BufferProvider presenterBuffer;
-
     private volatile boolean onLoginScreen;
     private volatile boolean open;
-    private volatile Layout layout = new Layout();
-    private volatile int page;
+
+    // Everything below is only touched on the Swing thread.
+    private JWindow window;
+    private Timer timer;
+    private int mouseX = -1;
+    private int mouseY = -1;
+    private Layout layout = new Layout();
+    private int page;
     // Primary and secondary sort, as the old client kept them.
     private final int[] sortBy = {SORT_WORLD, SORT_PLAYERS};
     private final boolean[] sortDesc = {false, false};
-    private volatile boolean resort;
+    private boolean resort;
 
     private WorldResult lastResult;
     private List<World> worlds = new ArrayList<>();
@@ -189,31 +180,22 @@ public class OldWorldSelectPlugin extends Plugin
     private Sprite[] stars;
     private Sprite leftArrow;
     private Sprite rightArrow;
-    private boolean spritesLoaded;
 
+    // Sees clicks on the login screen itself; while the world select is up, its window is in
+    // front of the canvas and gets the mouse instead.
     private final MouseAdapter mouseListener = new MouseAdapter()
     {
+        // The world button press we consumed; its release and click are consumed too.
+        private boolean swallowRelease;
+
         @Override
         public MouseEvent mousePressed(MouseEvent e)
         {
-            if (!onLoginScreen)
-            {
-                return e;
-            }
-            if (open)
-            {
-                if (SwingUtilities.isLeftMouseButton(e))
-                {
-                    click(e.getX(), e.getY());
-                }
-                e.consume();
-                return e;
-            }
-            int pad = (client.getCanvasWidth() - SCREEN_W) / 2;
-            int x = e.getX() - pad;
-            if (SwingUtilities.isLeftMouseButton(e)
+            int x = e.getX() - (client.getCanvasWidth() - SCREEN_W) / 2;
+            swallowRelease = onLoginScreen && SwingUtilities.isLeftMouseButton(e)
                 && x >= SWITCH_X && x <= SWITCH_X + SWITCH_W
-                && e.getY() >= SWITCH_Y && e.getY() <= SWITCH_Y + SWITCH_H)
+                && e.getY() >= SWITCH_Y && e.getY() <= SWITCH_Y + SWITCH_H;
+            if (swallowRelease)
             {
                 openSelect();
                 e.consume();
@@ -224,31 +206,27 @@ public class OldWorldSelectPlugin extends Plugin
         @Override
         public MouseEvent mouseReleased(MouseEvent e)
         {
-            return swallow(e);
+            if (swallowRelease)
+            {
+                e.consume();
+            }
+            return e;
         }
 
         @Override
         public MouseEvent mouseClicked(MouseEvent e)
         {
-            return swallow(e);
-        }
-
-        @Override
-        public MouseEvent mouseDragged(MouseEvent e)
-        {
-            return swallow(e);
-        }
-
-        private MouseEvent swallow(MouseEvent e)
-        {
-            if (onLoginScreen && open)
+            if (swallowRelease)
             {
+                swallowRelease = false;
                 e.consume();
             }
             return e;
         }
     };
 
+    // The window never takes keyboard focus, so keys still arrive at the client. They are
+    // kept away from the login form while the world select is up, and Escape closes it.
     private final KeyListener keyListener = new KeyListener()
     {
         @Override
@@ -267,7 +245,7 @@ public class OldWorldSelectPlugin extends Plugin
             {
                 if (e.getKeyCode() == KeyEvent.VK_ESCAPE)
                 {
-                    open = false;
+                    SwingUtilities.invokeLater(OldWorldSelectPlugin.this::close);
                 }
                 e.consume();
             }
@@ -286,9 +264,10 @@ public class OldWorldSelectPlugin extends Plugin
     @Override
     protected void startUp()
     {
-        mouseManager.registerMouseListener(0, mouseListener);
+        // Appended, not put first: Stretched Mode registers its coordinate translation at the
+        // front, and this has to run after it to see clicks in game coordinates.
+        mouseManager.registerMouseListener(mouseListener);
         keyManager.registerKeyListener(keyListener);
-        drawManager.registerEveryFrameListener(frameListener);
         clientThread.invoke(() -> stateChanged(client.getGameState()));
     }
 
@@ -297,19 +276,16 @@ public class OldWorldSelectPlugin extends Plugin
     {
         mouseManager.unregisterMouseListener(mouseListener);
         keyManager.unregisterKeyListener(keyListener);
-        drawManager.unregisterEveryFrameListener(frameListener);
-        open = false;
         onLoginScreen = false;
-        clientThread.invoke(() ->
+        SwingUtilities.invokeLater(() ->
         {
-            unhook();
+            close();
             backs = null;
             flags = null;
             arrows = null;
             stars = null;
             leftArrow = null;
             rightArrow = null;
-            spritesLoaded = false;
             worlds = new ArrayList<>();
             lastResult = null;
         });
@@ -323,183 +299,14 @@ public class OldWorldSelectPlugin extends Plugin
 
     private void stateChanged(GameState state)
     {
-        boolean login = state == GameState.LOGIN_SCREEN || state == GameState.LOGIN_SCREEN_AUTHENTICATOR;
-        onLoginScreen = login;
-        if (!login)
-        {
-            open = false;
-            unhook();
-        }
+        // The window closes itself on its next tick once this goes false.
+        onLoginScreen = state == GameState.LOGIN_SCREEN || state == GameState.LOGIN_SCREEN_AUTHENTICATOR;
     }
 
-    // ---- drawing hooks ----
-
-    /**
-     * Runs on the client thread at the end of every frame, with or without the GPU plugin.
-     * Nothing is hooked unless the world select is open, and everything is put back the
-     * frame after it closes.
-     *
-     * With a GPU plugin: its draw callbacks are wrapped in a pass-through.
-     *
-     * Without one: the client normally puts its frame on the window before any plugin can
-     * add to it, which is what made drawing afterwards flicker. So for as long as the world
-     * select is open the client is told that frames are handed over by draw callbacks (the
-     * same switch the GPU plugin uses), and {@link FramePresenter} puts the finished frame,
-     * world select included, on the window in one go.
-     */
-    private void onFrame()
-    {
-        if (!open || !onLoginScreen)
-        {
-            unhook();
-            return;
-        }
-        DrawCallbacks current = client.getDrawCallbacks();
-        if (current != null && (current == wrapper || current == presenter))
-        {
-            return;
-        }
-        // Whatever we had installed has been replaced or removed by something else.
-        wrapper = null;
-        presenter = null;
-        presenterBuffer = null;
-        if (current == null)
-        {
-            presenter = new FramePresenter();
-            presenterBuffer = client.getBufferProvider();
-            client.setDrawCallbacks(presenter);
-            client.setGpuFlags(DrawCallbacks.GPU);
-        }
-        else
-        {
-            wrapper = new PassThroughDrawCallbacks(current, this::paintBuffer);
-            client.setDrawCallbacks(wrapper);
-        }
-    }
-
-    private void unhook()
-    {
-        if (wrapper != null)
-        {
-            // Only put the original back if nothing else replaced ours in the meantime.
-            if (client.getDrawCallbacks() == wrapper)
-            {
-                client.setDrawCallbacks(wrapper.delegate);
-            }
-            wrapper = null;
-        }
-        if (presenter != null)
-        {
-            if (client.getDrawCallbacks() == presenter)
-            {
-                client.setDrawCallbacks(null);
-                client.setGpuFlags(0);
-                if (client.getBufferProvider() != presenterBuffer)
-                {
-                    // The window was resized while we were presenting, so the game buffer
-                    // was rebuilt in GPU form; have the client rebuild it for normal drawing.
-                    client.resizeCanvas();
-                }
-            }
-            presenter = null;
-            presenterBuffer = null;
-        }
-    }
-
-    /** GPU off: puts each finished frame on the window while the world select is open. */
-    private final class FramePresenter implements DrawCallbacks
-    {
-        @Override
-        public void draw(int overlayColor)
-        {
-            paintBuffer();
-            Image shown = null;
-            try
-            {
-                shown = presentFrame();
-            }
-            catch (RuntimeException ex)
-            {
-                log.warn("Old World Select: presenting the frame failed", ex);
-                open = false;
-            }
-            // The client skips this while draw callbacks present the frame. It keeps
-            // screenshots working and runs onFrame, which unhooks once the select closes.
-            final Image frame = shown;
-            drawManager.processDrawComplete(() -> copyOf(frame));
-        }
-
-        @Override
-        public void swapScene(Scene scene)
-        {
-        }
-    }
-
-    private Image presentFrame()
-    {
-        BufferProvider buffer = client.getBufferProvider();
-        Canvas canvas = client.getCanvas();
-        if (!(buffer instanceof MainBufferProvider) || canvas == null)
-        {
-            return null;
-        }
-        Image image = ((MainBufferProvider) buffer).getImage();
-        Graphics cg = image == null ? null : canvas.getGraphics();
-        if (cg == null)
-        {
-            return image;
-        }
-        try
-        {
-            if (client.isStretchedEnabled())
-            {
-                Dimension stretched = client.getStretchedDimensions();
-                if (cg instanceof Graphics2D)
-                {
-                    ((Graphics2D) cg).setRenderingHint(RenderingHints.KEY_INTERPOLATION, client.isStretchedFast()
-                        ? RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR
-                        : RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-                }
-                cg.drawImage(image, 0, 0, stretched.width, stretched.height, null);
-            }
-            else
-            {
-                cg.drawImage(image, 0, 0, null);
-            }
-        }
-        finally
-        {
-            cg.dispose();
-        }
-        return image;
-    }
-
-    private static Image copyOf(Image image)
-    {
-        if (image == null)
-        {
-            return null;
-        }
-        BufferedImage copy = new BufferedImage(image.getWidth(null), image.getHeight(null), BufferedImage.TYPE_INT_RGB);
-        Graphics g = copy.getGraphics();
-        try
-        {
-            g.drawImage(image, 0, 0, null);
-        }
-        finally
-        {
-            g.dispose();
-        }
-        return copy;
-    }
-
-    // ---- state ----
+    // ---- window ----
 
     private void openSelect()
     {
-        page = 0;
-        resort = true;
-        open = true;
         // Fresh player counts; the list already in memory is shown until this returns.
         executor.execute(() ->
         {
@@ -512,7 +319,158 @@ public class OldWorldSelectPlugin extends Plugin
                 log.debug("World list refresh failed", ex);
             }
         });
+        // Sprites have to be read on the client thread; the window belongs to the Swing thread.
+        clientThread.invoke(() ->
+        {
+            final Sprite[][] loaded = {
+                load(SpriteID.SL_BACK), load(SpriteID.SL_FLAGS), load(SpriteID.SL_ARROWS),
+                load(SpriteID.SL_STARS), load(SpriteID.LEFTARROW), load(SpriteID.RIGHTARROW)};
+            SwingUtilities.invokeLater(() -> show(loaded));
+        });
     }
+
+    private void show(Sprite[][] loaded)
+    {
+        close();
+        Canvas canvas = client.getCanvas();
+        if (!onLoginScreen || canvas == null || !canvas.isShowing())
+        {
+            return;
+        }
+        backs = loaded[0];
+        flags = loaded[1];
+        arrows = loaded[2];
+        stars = loaded[3];
+        leftArrow = loaded[4] == null ? null : loaded[4][0];
+        rightArrow = loaded[5] == null ? null : loaded[5][0];
+        page = 0;
+        resort = true;
+        mouseX = -1;
+        mouseY = -1;
+
+        window = new JWindow(SwingUtilities.getWindowAncestor(canvas));
+        window.setFocusableWindowState(false);
+        window.setContentPane(new SelectPanel());
+        window.setBounds(new Rectangle(canvas.getLocationOnScreen(), canvas.getSize()));
+        window.setVisible(true);
+        open = true;
+        // Keeps the window over the canvas as the client moves or resizes, and the player
+        // counts current.
+        timer = new Timer(50, e -> tick());
+        timer.start();
+    }
+
+    private void tick()
+    {
+        Canvas canvas = client.getCanvas();
+        if (!onLoginScreen || canvas == null || !canvas.isShowing())
+        {
+            close();
+            return;
+        }
+        Rectangle bounds = new Rectangle(canvas.getLocationOnScreen(), canvas.getSize());
+        if (!bounds.equals(window.getBounds()))
+        {
+            window.setBounds(bounds);
+        }
+        window.repaint();
+    }
+
+    private void close()
+    {
+        open = false;
+        if (timer != null)
+        {
+            timer.stop();
+            timer = null;
+        }
+        if (window != null)
+        {
+            window.dispose();
+            window = null;
+        }
+    }
+
+    /** The world select itself, laid out in game pixels and scaled to the canvas. */
+    private final class SelectPanel extends JComponent
+    {
+        SelectPanel()
+        {
+            java.awt.event.MouseAdapter mouse = new java.awt.event.MouseAdapter()
+            {
+                @Override
+                public void mouseMoved(MouseEvent e)
+                {
+                    mouseX = e.getX() * gameWidth() / Math.max(1, getWidth());
+                    mouseY = e.getY() * gameHeight() / Math.max(1, getHeight());
+                    repaint();
+                }
+
+                @Override
+                public void mouseDragged(MouseEvent e)
+                {
+                    mouseMoved(e);
+                }
+
+                @Override
+                public void mouseExited(MouseEvent e)
+                {
+                    mouseX = -1;
+                    mouseY = -1;
+                    repaint();
+                }
+
+                @Override
+                public void mousePressed(MouseEvent e)
+                {
+                    mouseMoved(e);
+                    if (SwingUtilities.isLeftMouseButton(e))
+                    {
+                        click(mouseX, mouseY);
+                    }
+                }
+            };
+            addMouseListener(mouse);
+            addMouseMotionListener(mouse);
+        }
+
+        // With stretched mode on the canvas is bigger than the game; these are game pixels.
+        private int gameWidth()
+        {
+            int w = client.getCanvasWidth();
+            return w > 0 ? w : Math.max(1, getWidth());
+        }
+
+        private int gameHeight()
+        {
+            int h = client.getCanvasHeight();
+            return h > 0 ? h : Math.max(1, getHeight());
+        }
+
+        @Override
+        protected void paintComponent(Graphics graphics)
+        {
+            Graphics2D g = (Graphics2D) graphics.create();
+            try
+            {
+                int w = gameWidth();
+                int h = gameHeight();
+                g.setColor(Color.BLACK);
+                g.fillRect(0, 0, getWidth(), getHeight());
+                g.scale(getWidth() / (double) w, getHeight() / (double) h);
+                g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
+                g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR);
+                updateWorlds();
+                paintSelect(g, w, h);
+            }
+            finally
+            {
+                g.dispose();
+            }
+        }
+    }
+
+    // ---- state ----
 
     private void click(int x, int y)
     {
@@ -536,14 +494,14 @@ public class OldWorldSelectPlugin extends Plugin
         }
         if (rx >= 708 && rx <= 758 && y >= 4 && y <= 20)
         {
-            open = false;
+            close();
             return;
         }
-        if (l.hovered != -1)
+        if (l.hovered >= 0 && l.hovered < worlds.size())
         {
-            final int index = l.hovered;
-            open = false;
-            clientThread.invoke(() -> changeWorld(index));
+            final World world = worlds.get(l.hovered);
+            close();
+            clientThread.invoke(() -> changeWorld(world));
             return;
         }
         if (y >= l.canvasH / 2 - 50 && y <= l.canvasH / 2 + 50)
@@ -559,7 +517,7 @@ public class OldWorldSelectPlugin extends Plugin
         }
     }
 
-    private synchronized void sort(int option, boolean desc)
+    private void sort(int option, boolean desc)
     {
         if (sortBy[0] != option)
         {
@@ -571,18 +529,13 @@ public class OldWorldSelectPlugin extends Plugin
         resort = true;
     }
 
-    private void changeWorld(int index)
+    private void changeWorld(World world)
     {
-        if (index < 0 || index >= worlds.size())
-        {
-            return;
-        }
         GameState state = client.getGameState();
         if (state != GameState.LOGIN_SCREEN && state != GameState.LOGIN_SCREEN_AUTHENTICATOR)
         {
             return;
         }
-        World world = worlds.get(index);
         net.runelite.api.World rsWorld = client.createWorld();
         rsWorld.setActivity(world.getActivity());
         rsWorld.setAddress(world.getAddress());
@@ -607,23 +560,12 @@ public class OldWorldSelectPlugin extends Plugin
         {
             sorted.addAll(result.getWorlds());
         }
-        final int by0;
-        final int by1;
-        final boolean desc0;
-        final boolean desc1;
-        synchronized (this)
-        {
-            by0 = sortBy[0];
-            by1 = sortBy[1];
-            desc0 = sortDesc[0];
-            desc1 = sortDesc[1];
-        }
         Comparator<World> order = (a, b) ->
         {
-            int c = compare(a, b, by0, desc0);
+            int c = compare(a, b, sortBy[0], sortDesc[0]);
             if (c == 0)
             {
-                c = compare(a, b, by1, desc1);
+                c = compare(a, b, sortBy[1], sortDesc[1]);
             }
             return c != 0 ? c : Integer.compare(a.getId(), b.getId());
         };
@@ -667,23 +609,6 @@ public class OldWorldSelectPlugin extends Plugin
 
     // ---- drawing ----
 
-    private void loadSprites()
-    {
-        if (spritesLoaded)
-        {
-            return;
-        }
-        backs = load(SpriteID.SL_BACK);
-        flags = load(SpriteID.SL_FLAGS);
-        arrows = load(SpriteID.SL_ARROWS);
-        stars = load(SpriteID.SL_STARS);
-        Sprite[] left = load(SpriteID.LEFTARROW);
-        Sprite[] right = load(SpriteID.RIGHTARROW);
-        leftArrow = left == null ? null : left[0];
-        rightArrow = right == null ? null : right[0];
-        spritesLoaded = backs != null && flags != null && arrows != null && stars != null;
-    }
-
     private Sprite[] load(int spriteId)
     {
         SpritePixels[] pixels = client.getSprites(client.getIndexSprites(), spriteId, 0);
@@ -699,53 +624,11 @@ public class OldWorldSelectPlugin extends Plugin
         return out;
     }
 
-    /** Paints the world select into the game buffer, just before the frame is handed over. */
-    private void paintBuffer()
-    {
-        if (!open)
-        {
-            return;
-        }
-        try
-        {
-            BufferProvider buffer = client.getBufferProvider();
-            if (!(buffer instanceof MainBufferProvider))
-            {
-                return;
-            }
-            Image image = ((MainBufferProvider) buffer).getImage();
-            if (image == null)
-            {
-                return;
-            }
-            loadSprites();
-            updateWorlds();
-            Graphics2D g = (Graphics2D) image.getGraphics();
-            try
-            {
-                g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
-                paint(g, buffer.getWidth(), buffer.getHeight());
-            }
-            finally
-            {
-                g.dispose();
-            }
-        }
-        catch (RuntimeException ex)
-        {
-            log.warn("Old World Select: drawing failed", ex);
-            open = false;
-        }
-    }
-
-    private void paint(Graphics2D g, int canvasW, int canvasH)
+    private void paintSelect(Graphics2D g, int canvasW, int canvasH)
     {
         final Font bold = FontManager.getRunescapeBoldFont();
         final Font small = FontManager.getRunescapeSmallFont();
         final int pad = (canvasW - SCREEN_W) / 2;
-        final net.runelite.api.Point mouse = client.getMouseCanvasPosition();
-        final int mouseX = mouse == null ? -1 : mouse.getX();
-        final int mouseY = mouse == null ? -1 : mouse.getY();
 
         Layout l = new Layout();
         l.canvasW = canvasW;
@@ -772,13 +655,8 @@ public class OldWorldSelectPlugin extends Plugin
 
         if (arrows != null && arrows.length >= 4)
         {
-            final int by;
-            final boolean desc;
-            synchronized (this)
-            {
-                by = sortBy[0];
-                desc = sortDesc[0];
-            }
+            final int by = sortBy[0];
+            final boolean desc = sortDesc[0];
             for (int i = 0; i < SORT_X.length; i++)
             {
                 int x = pad + SORT_X[i];
